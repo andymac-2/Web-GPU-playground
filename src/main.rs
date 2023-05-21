@@ -1,17 +1,34 @@
-use std::borrow::Cow;
+use bytemuck::{ Pod, Zeroable };
+use std::{borrow::Cow, io::Write, io::BufWriter};
 use wgpu::util::DeviceExt;
 
-type Complex = [f32; 2];
-
-async fn run() {
-    let numbers = vec![[1.0, 0.0], [0.0, 0.0], [1.0, 0.0], [0.0, 0.0]];
-
-    for value in execute_gpu(&numbers).await.unwrap() {
-        println!("{:?}", value);
-    }
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct Colour {
+    red: f32,
+    green: f32,
+    blue: f32
 }
 
-async fn execute_gpu(numbers: &[Complex]) -> Option<Vec<Complex>> {
+const IMAGE_WIDTH: usize = 1024;
+const IMAGE_HEIGHT: usize = 512;
+
+async fn run() {
+    // bufer writes to stdout for performance
+    let handle = &std::io::stdout();
+    let mut buf = BufWriter::new(handle);
+
+    writeln!(buf, "P3").unwrap();
+    writeln!(buf, "{} {}", IMAGE_WIDTH, IMAGE_HEIGHT).unwrap();
+    writeln!(buf, "255").unwrap();
+    for value in execute_gpu::<Colour>().await.unwrap() {
+        writeln!(buf, "{} {} {}", (value.red * 255.0) as u8, (value.green * 255.0) as u8, (value.blue * 255.0) as u8).unwrap();
+    }
+
+    buf.flush().unwrap();
+}
+
+async fn execute_gpu<Out: Pod>() -> Option<Vec<Out>> {
     let instance = wgpu::Instance::default();
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions::default())
@@ -35,31 +52,17 @@ async fn execute_gpu(numbers: &[Complex]) -> Option<Vec<Complex>> {
         return None;
     }
 
-    execute_gpu_inner(&device, &queue, numbers).await
-}
-
-async fn execute_gpu_inner(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    numbers: &[Complex],
-) -> Option<Vec<Complex>> {
     let cs_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: None,
-        source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shader.wgsl"))),
+        source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("raytracer.wgsl"))),
     });
 
-    let number_buffer = bytemuck::cast_slice(numbers);
-    let size = number_buffer.len().try_into().unwrap();
+    eprintln!("Finished compiling shader");
 
-    let input_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("Input Buffer"),
-        contents: number_buffer,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-    });
-
+    let output_size: u64 = (IMAGE_WIDTH * IMAGE_HEIGHT * std::mem::size_of::<Colour>()).try_into().unwrap();
     let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("Output Buffer"),
-        size,
+        size: output_size,
         usage: wgpu::BufferUsages::STORAGE
             | wgpu::BufferUsages::COPY_SRC
             | wgpu::BufferUsages::COPY_DST,
@@ -68,7 +71,7 @@ async fn execute_gpu_inner(
 
     let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("Staging Buffer"),
-        size,
+        size: output_size,
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -80,7 +83,7 @@ async fn execute_gpu_inner(
                 binding: 0,
                 visibility: wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
                     has_dynamic_offset: false,
                     min_binding_size: None,
                 },
@@ -90,7 +93,7 @@ async fn execute_gpu_inner(
                 binding: 1,
                 visibility: wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
                     min_binding_size: None,
                 },
@@ -112,32 +115,42 @@ async fn execute_gpu_inner(
         entry_point: "main",
     });
 
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("Bind group"),
-        layout: &bind_group_layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: input_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: output_buffer.as_entire_binding(),
-            },
-        ],
-    });
+    for i in 0..IMAGE_WIDTH {
+        let globals_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Globals Buffer"),
+            contents: bytemuck::bytes_of(&(i as u32)),
+            usage: wgpu::BufferUsages::UNIFORM
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+        });
 
-    let mut encoder =
-        device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-    {
-        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
-        cpass.set_pipeline(&compute_pipeline);
-        cpass.set_bind_group(0, &bind_group, &[]);
-        cpass.insert_debug_marker("compute collatz iterations");
-        cpass.dispatch_workgroups(numbers.len().try_into().unwrap(), 1, 1);
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Bind group"),
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: output_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: globals_buffer.as_entire_binding(),
+                }
+            ],
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
+            cpass.set_pipeline(&compute_pipeline);
+            cpass.set_bind_group(0, &bind_group, &[]);
+            cpass.dispatch_workgroups(1, IMAGE_HEIGHT.try_into().unwrap(), 1);
+        }
+        queue.submit(Some(encoder.finish()));
     }
 
-    encoder.copy_buffer_to_buffer(&output_buffer, 0, &staging_buffer, 0, size);
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    encoder.copy_buffer_to_buffer(&output_buffer, 0, &staging_buffer, 0, output_size);
 
     queue.submit(Some(encoder.finish()));
 
@@ -147,6 +160,8 @@ async fn execute_gpu_inner(
     device.poll(wgpu::Maintain::Wait);
 
     receiver.receive().await.unwrap().unwrap();
+
+    eprintln!("Finished compute shader");
 
     let result;
     {
